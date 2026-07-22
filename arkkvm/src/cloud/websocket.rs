@@ -317,7 +317,9 @@ impl CloudWebSocketClient {
             return Err(e);
         }
 
-        crate::webrtc::handle_session_takeover(app_state.clone(), &session_id).await;
+        crate::webrtc::handle_session_takeover(app_state.clone(), session.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to promote cloud WebRTC session: {}", e))?;
 
         info!("Cloud WebRTC session created successfully with id: {}", &session_id);
         Ok(())

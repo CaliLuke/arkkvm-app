@@ -129,8 +129,24 @@ impl AppState {
         *self.current_session.write().await = session_id;
     }
 
-    pub async fn swap_current_session_id(&self, session_id: String) -> Option<String> {
-        self.current_session.write().await.replace(session_id)
+    /// Atomically verify and publish an exact session generation while
+    /// capturing the exact predecessor generation. Holding the sessions read
+    /// lock prevents removal or ID reuse between validation and capture.
+    pub async fn promote_session_if_registered(
+        &self,
+        session: &Arc<Session>,
+    ) -> Result<Option<Arc<Session>>, ()> {
+        let sessions = self.sessions.read().await;
+        if !sessions
+            .get(&session.id)
+            .is_some_and(|registered| Arc::ptr_eq(registered, session))
+        {
+            return Err(());
+        }
+
+        let mut current = self.current_session.write().await;
+        let previous_id = current.replace(session.id.clone());
+        Ok(previous_id.and_then(|id| sessions.get(&id).cloned()))
     }
 
     pub async fn set_current_session_if_none(&self, session_id: String) -> bool {

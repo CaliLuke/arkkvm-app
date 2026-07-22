@@ -380,11 +380,13 @@ impl WebRTCApi {
                                 debug!("Ignoring Disconnected callback from stale session {}", session_id);
                                 return;
                             }
-                            // A non-current generation never owns the global sinks.
-                            if !app_state.clear_current_session_if(&session_id).await {
+                            // Keep the current marker during a transient disconnect so
+                            // takeover can still identify and close this predecessor.
+                            if app_state.get_current_session_id().await.as_deref()
+                                != Some(session_id.as_str())
+                            {
                                 return;
                             }
-                            on_active_sessions_changed().await;
 
                             // Only detach sink if there is no active current session
                             if let Some(track) = video_track.clone() {
@@ -408,12 +410,15 @@ impl WebRTCApi {
                         }
 
                         RTCIceConnectionState::Failed | RTCIceConnectionState::Closed => {
-                            let removed = if let Some(peer_connection) = peer_connection.upgrade() {
-                                app_state
-                                    .remove_session_for_peer(&session_id, &peer_connection)
-                                    .await
-                            } else {
-                                None
+                            let removed = {
+                                let _guard = MEDIA_LIFECYCLE_LOCK.lock().await;
+                                if let Some(peer_connection) = peer_connection.upgrade() {
+                                    app_state
+                                        .remove_session_for_peer(&session_id, &peer_connection)
+                                        .await
+                                } else {
+                                    None
+                                }
                             };
 
                             // A failed ICE transport does not stop the peer connection's
@@ -884,52 +889,57 @@ async fn send_ice_candidate(
 /// Handle session takeover: send otherSessionConnected to old session and close it after delay
 pub async fn handle_session_takeover(
     app_state: std::sync::Arc<crate::state::AppState>,
-    new_session_id: &str,
-) {
+    new_session: Arc<Session>,
+) -> anyhow::Result<()> {
+    let new_session_id = new_session.id.clone();
     let maybe_old = {
         let _guard = MEDIA_LIFECYCLE_LOCK.lock().await;
-        let previous = app_state.swap_current_session_id(new_session_id.to_string()).await;
+        let previous = app_state
+            .promote_session_if_registered(&new_session)
+            .await
+            .map_err(|()| anyhow::anyhow!("session {} is no longer registered", new_session_id))?;
         on_active_sessions_changed().await;
         let connection_state = app_state
-            .get_session_by_id(new_session_id)
+            .get_session_by_id(&new_session_id)
             .await
-            .and_then(|session| session.peer_connection.clone())
+            .and_then(|registered| registered.peer_connection.clone())
             .map(|peer| peer.ice_connection_state())
             .unwrap_or(RTCIceConnectionState::Unspecified);
         attach_current_session_sinks_if_connected(
             &app_state,
-            new_session_id,
+            &new_session_id,
             connection_state,
         )
         .await;
         previous
     };
 
-    if let Some(ref old_id) = maybe_old
-        && *old_id != new_session_id
+    if let Some(old_session) = maybe_old
+        && !Arc::ptr_eq(&old_session, &new_session)
     {
+        let old_id = old_session.id.clone();
         // Capture the old peer generation now. The delayed cleanup must not
         // close a replacement that later reuses the same signaling ID.
-        if let Some(old_session) = app_state.get_session_by_id(old_id).await {
-            if let Err(e) = PROCESSOR
-                .send_event("otherSessionConnected", None, old_session.clone())
-                .await
-            {
-                tracing::warn!("Failed to send otherSessionConnected to session {}: {}", old_id, e);
-            } else {
-                tracing::info!("Sent otherSessionConnected to old session {}", old_id);
-            }
+        if let Err(e) = PROCESSOR
+            .send_event("otherSessionConnected", None, old_session.clone())
+            .await
+        {
+            tracing::warn!("Failed to send otherSessionConnected to session {}: {}", old_id, e);
+        } else {
+            tracing::info!("Sent otherSessionConnected to old session {}", old_id);
+        }
 
-            if let Some(old_peer) = old_session.peer_connection.clone() {
-                tokio::spawn(close_previous_session_after_delay(
-                    app_state.clone(),
-                    old_id.clone(),
-                    old_peer,
-                    tokio::time::Duration::from_secs(1),
-                ));
-            }
+        if let Some(old_peer) = old_session.peer_connection.clone() {
+            tokio::spawn(close_previous_session_after_delay(
+                app_state.clone(),
+                old_id,
+                old_peer,
+                tokio::time::Duration::from_secs(1),
+            ));
         }
     }
+
+    Ok(())
 }
 
 async fn close_previous_session_after_delay(
@@ -1056,16 +1066,33 @@ mod tests {
     #[tokio::test]
     async fn concurrent_current_session_swaps_preserve_every_predecessor() {
         let app_state = crate::state::AppState::new();
+        let original = Arc::new(crate::session::Session::new("original".to_string()));
+        let first = Arc::new(crate::session::Session::new("first".to_string()));
+        let second = Arc::new(crate::session::Session::new("second".to_string()));
+        {
+            let mut sessions = app_state.sessions.write().await;
+            sessions.insert(original.id.clone(), original);
+            sessions.insert(first.id.clone(), first.clone());
+            sessions.insert(second.id.clone(), second.clone());
+        }
         app_state.set_current_session_id(Some("original".to_string())).await;
 
         let (first_previous, second_previous) = tokio::join!(
-            app_state.swap_current_session_id("first".to_string()),
-            app_state.swap_current_session_id("second".to_string()),
+            app_state.promote_session_if_registered(&first),
+            app_state.promote_session_if_registered(&second),
         );
 
         let mut observed = vec![
-            first_previous.expect("first swap should return a predecessor"),
-            second_previous.expect("second swap should return a predecessor"),
+            first_previous
+                .expect("first promotion should succeed")
+                .expect("first promotion should return a predecessor")
+                .id
+                .clone(),
+            second_previous
+                .expect("second promotion should succeed")
+                .expect("second promotion should return a predecessor")
+                .id
+                .clone(),
             app_state
                 .get_current_session_id()
                 .await
@@ -1073,6 +1100,27 @@ mod tests {
         ];
         observed.sort();
         assert_eq!(observed, vec!["first", "original", "second"]);
+    }
+
+    #[tokio::test]
+    async fn promotion_rejects_a_session_removed_before_takeover() {
+        let app_state = crate::state::AppState::new();
+        let current = Arc::new(crate::session::Session::new("current".to_string()));
+        let removed_candidate = Arc::new(crate::session::Session::new("removed".to_string()));
+        app_state
+            .sessions
+            .write()
+            .await
+            .insert(current.id.clone(), current);
+        app_state.set_current_session_id(Some("current".to_string())).await;
+
+        assert!(
+            app_state
+                .promote_session_if_registered(&removed_candidate)
+                .await
+                .is_err()
+        );
+        assert_eq!(app_state.get_current_session_id().await.as_deref(), Some("current"));
     }
 
     #[tokio::test]

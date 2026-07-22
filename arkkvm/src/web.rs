@@ -949,7 +949,12 @@ async fn handle_webrtc_session(
     let session_id = session.id.clone();
     info!("WebRTC session created successfully with id: {}", &session_id);
     // Takeover: close previous current session after 1s
-    crate::webrtc::handle_session_takeover(app_state.clone(), &session_id).await;
+    crate::webrtc::handle_session_takeover(app_state.clone(), session.clone())
+        .await
+        .map_err(|e| {
+            StatusError::internal_server_error()
+                .brief(format!("Failed to promote WebRTC session: {e}"))
+        })?;
 
     // app_state.add_session(session).await;
     // app_state.set_current_session_id(Some(session_id)).await;
@@ -1365,9 +1370,9 @@ async fn handle_webrtc_websocket_message(
                                     // Takeover: make this the current session, close the previous after 1s
                                     crate::webrtc::handle_session_takeover(
                                         app_state.clone(),
-                                        connection_id,
+                                        session.clone(),
                                     )
-                                    .await;
+                                    .await?;
 
                                 }
                                 Err(e) => {
