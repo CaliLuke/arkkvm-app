@@ -79,6 +79,7 @@ async fn close_removed_session(session: Arc<Session>) {
 }
 
 async fn cleanup_last_session_resources(app_state: &crate::state::AppState) {
+    let _guard = MEDIA_LIFECYCLE_LOCK.lock().await;
     if app_state.session_count().await != 0 {
         return;
     }
@@ -105,6 +106,20 @@ pub(crate) async fn remove_and_close_session(
     session_id: &str,
 ) -> bool {
     let Some(session) = app_state.remove_session(session_id).await else {
+        return false;
+    };
+
+    close_removed_session(session).await;
+    cleanup_last_session_resources(app_state).await;
+    true
+}
+
+async fn remove_and_close_session_for_peer(
+    app_state: &crate::state::AppState,
+    session_id: &str,
+    peer_connection: &Arc<webrtc::peer_connection::RTCPeerConnection>,
+) -> bool {
+    let Some(session) = app_state.remove_session_for_peer(session_id, peer_connection).await else {
         return false;
     };
 
@@ -289,6 +304,7 @@ impl WebRTCApi {
 
                     match connection_state {
                         RTCIceConnectionState::Connected => {
+                            let _guard = MEDIA_LIFECYCLE_LOCK.lock().await;
                             // Signaling normally publishes the current session before ICE
                             // connects. Only fill an empty slot so a slower old connection
                             // cannot overwrite a newer takeover.
@@ -310,6 +326,7 @@ impl WebRTCApi {
                         }
 
                         RTCIceConnectionState::Disconnected => {
+                            let _guard = MEDIA_LIFECYCLE_LOCK.lock().await;
                             // Clear current session if this was the current one
                             if app_state.clear_current_session_if(&session_id).await {
                                 on_active_sessions_changed().await;
@@ -823,24 +840,39 @@ pub async fn handle_session_takeover(
     if let Some(ref old_id) = maybe_old
         && *old_id != new_session_id
     {
-        // Send otherSessionConnected event to old session
+        // Capture the old peer generation now. The delayed cleanup must not
+        // close a replacement that later reuses the same signaling ID.
         if let Some(old_session) = app_state.get_session_by_id(old_id).await {
-            if let Err(e) = PROCESSOR.send_event("otherSessionConnected", None, old_session).await {
+            if let Err(e) = PROCESSOR
+                .send_event("otherSessionConnected", None, old_session.clone())
+                .await
+            {
                 tracing::warn!("Failed to send otherSessionConnected to session {}: {}", old_id, e);
             } else {
                 tracing::info!("Sent otherSessionConnected to old session {}", old_id);
             }
-        }
 
-        // Close old session after 1 second delay
-        let app_state_cl = app_state.clone();
-        let old_id_cl = old_id.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            if remove_and_close_session(&app_state_cl, &old_id_cl).await {
-                tracing::info!("Closed previous session {}", old_id_cl);
+            if let Some(old_peer) = old_session.peer_connection.clone() {
+                tokio::spawn(close_previous_session_after_delay(
+                    app_state.clone(),
+                    old_id.clone(),
+                    old_peer,
+                    tokio::time::Duration::from_secs(1),
+                ));
             }
-        });
+        }
+    }
+}
+
+async fn close_previous_session_after_delay(
+    app_state: Arc<crate::state::AppState>,
+    old_id: String,
+    old_peer: Arc<webrtc::peer_connection::RTCPeerConnection>,
+    delay: tokio::time::Duration,
+) {
+    tokio::time::sleep(delay).await;
+    if remove_and_close_session_for_peer(&app_state, &old_id, &old_peer).await {
+        tracing::info!("Closed previous session {}", old_id);
     }
 }
 
@@ -848,7 +880,7 @@ pub async fn handle_session_takeover(
 mod tests {
     use std::sync::Arc;
 
-    use tokio::sync::{Notify, oneshot};
+    use tokio::sync::{Barrier, Notify, oneshot};
     use webrtc::api::APIBuilder;
     use webrtc::peer_connection::configuration::RTCConfiguration;
     use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -872,7 +904,6 @@ mod tests {
                 Arc::new(crate::session::Session::new("sentinel-session".to_string())),
             );
         }
-
         let (first_removal, second_removal) = tokio::join!(
             super::remove_and_close_session(&app_state, "test-session"),
             super::remove_and_close_session(&app_state, "test-session"),
@@ -911,6 +942,7 @@ mod tests {
                 Arc::new(crate::session::Session::new("sentinel-session".to_string())),
             );
         }
+        app_state.set_current_session_id(Some("reused-id".to_string())).await;
 
         let mut duplicate_session = crate::session::Session::new("reused-id".to_string());
         duplicate_session.peer_connection = Some(duplicate_peer.clone());
@@ -920,6 +952,11 @@ mod tests {
                 .remove_session_for_peer("reused-id", &duplicate_peer)
                 .await
                 .is_none()
+        );
+        assert_eq!(
+            app_state.get_current_session_id().await.as_deref(),
+            Some("reused-id"),
+            "a mismatched callback must not clear the replacement's current marker"
         );
 
         let registered = app_state
@@ -965,6 +1002,85 @@ mod tests {
         ];
         observed.sort();
         assert_eq!(observed, vec!["first", "original", "second"]);
+    }
+
+    #[tokio::test]
+    async fn delayed_takeover_cleanup_does_not_close_reused_session_id() {
+        let api = APIBuilder::new().build();
+        let old_peer = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .expect("old peer connection should be created"),
+        );
+        let replacement_peer = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .expect("replacement peer connection should be created"),
+        );
+        let app_state = Arc::new(crate::state::AppState::new());
+
+        let mut old_session = crate::session::Session::new("old-id".to_string());
+        old_session.peer_connection = Some(old_peer.clone());
+        let mut replacement_session = crate::session::Session::new("old-id".to_string());
+        replacement_session.peer_connection = Some(replacement_peer.clone());
+        let replacement_session = Arc::new(replacement_session);
+        {
+            let mut sessions = app_state.sessions.write().await;
+            sessions.insert("old-id".to_string(), Arc::new(old_session));
+            sessions.remove("old-id");
+            sessions.insert("old-id".to_string(), replacement_session.clone());
+            sessions.insert(
+                "new-current".to_string(),
+                Arc::new(crate::session::Session::new("new-current".to_string())),
+            );
+        }
+
+        super::close_previous_session_after_delay(
+            app_state.clone(),
+            "old-id".to_string(),
+            old_peer.clone(),
+            tokio::time::Duration::ZERO,
+        )
+        .await;
+
+        let registered = app_state
+            .get_session_by_id("old-id")
+            .await
+            .expect("replacement should remain registered");
+        assert!(Arc::ptr_eq(&registered, &replacement_session));
+        assert_ne!(
+            replacement_peer.connection_state(),
+            RTCPeerConnectionState::Closed
+        );
+
+        super::close_peer_connection(old_peer, "old-id-old-generation").await;
+        super::close_peer_connection(replacement_peer, "old-id-replacement").await;
+    }
+
+    #[tokio::test]
+    async fn reconnect_registration_wins_before_serialized_last_session_cleanup() {
+        let app_state = Arc::new(crate::state::AppState::new());
+        let lifecycle_guard = super::MEDIA_LIFECYCLE_LOCK.lock().await;
+        let cleanup_started = Arc::new(Barrier::new(2));
+        let cleanup_started_in_task = cleanup_started.clone();
+        let app_state_in_task = app_state.clone();
+
+        let cleanup_task = tokio::spawn(async move {
+            cleanup_started_in_task.wait().await;
+            super::cleanup_last_session_resources(&app_state_in_task).await;
+        });
+        cleanup_started.wait().await;
+        tokio::task::yield_now().await;
+        assert!(!cleanup_task.is_finished(), "cleanup should wait for the lifecycle lock");
+
+        app_state.sessions.write().await.insert(
+            "reconnected".to_string(),
+            Arc::new(crate::session::Session::new("reconnected".to_string())),
+        );
+        drop(lifecycle_guard);
+        cleanup_task.await.expect("cleanup task should finish");
+
+        assert!(app_state.get_session_by_id("reconnected").await.is_some());
     }
 
     #[tokio::test]

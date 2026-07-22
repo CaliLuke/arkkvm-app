@@ -101,15 +101,17 @@ impl AppState {
             (removed, count)
         };
 
-        // Clear current session if it was the removed one
-        let mut current = self.current_session.write().await;
-        if let Some(ref current_id) = *current
-            && current_id == session_id
-        {
-            *current = None;
+        // A stale callback for a different peer with the same ID must not
+        // clear the replacement's current-session marker.
+        if removed.is_some() {
+            let mut current = self.current_session.write().await;
+            if let Some(ref current_id) = *current
+                && current_id == session_id
+            {
+                *current = None;
+            }
         }
-        drop(current);
-        
+
         if removed.is_some() && count == 0 {
             tokio::spawn(crate::webrtc::on_last_session_disconnected());
         }
