@@ -91,13 +91,11 @@ async fn cleanup_last_session_resources(app_state: &crate::state::AppState) {
     if let Some(st) = storage_mod::get_virtual_media_state()
         && matches!(st.source, storage_mod::VirtualMediaSource::WebRTC)
     {
-        tokio::spawn(async move {
-            if let Err(e) = storage_mod::unmount_image().await {
-                warn!("failed to auto unmount WebRTC media: {}", e);
-            } else {
-                info!("auto unmounted WebRTC virtual media on last session close");
-            }
-        });
+        if let Err(e) = storage_mod::unmount_image().await {
+            warn!("failed to auto unmount WebRTC media: {}", e);
+        } else {
+            info!("auto unmounted WebRTC virtual media on last session close");
+        }
     }
 }
 
@@ -305,11 +303,24 @@ impl WebRTCApi {
                     match connection_state {
                         RTCIceConnectionState::Connected => {
                             let _guard = MEDIA_LIFECYCLE_LOCK.lock().await;
+                            let Some(callback_peer) = peer_connection.upgrade() else {
+                                return;
+                            };
+                            if !app_state.session_owns_peer(&session_id, &callback_peer).await {
+                                debug!("Ignoring Connected callback from stale session {}", session_id);
+                                return;
+                            }
                             // Signaling normally publishes the current session before ICE
                             // connects. Only fill an empty slot so a slower old connection
                             // cannot overwrite a newer takeover.
                             if app_state.set_current_session_if_none(session_id.clone()).await {
                                 on_active_sessions_changed().await;
+                            }
+                            if app_state.get_current_session_id().await.as_deref()
+                                != Some(session_id.as_str())
+                            {
+                                debug!("Skipping sink attach for non-current session {}", session_id);
+                                return;
                             }
 
                             // Bridge native video -> track (FFI ingress -> channel -> WebRTC)
@@ -327,10 +338,18 @@ impl WebRTCApi {
 
                         RTCIceConnectionState::Disconnected => {
                             let _guard = MEDIA_LIFECYCLE_LOCK.lock().await;
-                            // Clear current session if this was the current one
-                            if app_state.clear_current_session_if(&session_id).await {
-                                on_active_sessions_changed().await;
+                            let Some(callback_peer) = peer_connection.upgrade() else {
+                                return;
+                            };
+                            if !app_state.session_owns_peer(&session_id, &callback_peer).await {
+                                debug!("Ignoring Disconnected callback from stale session {}", session_id);
+                                return;
                             }
+                            // A non-current generation never owns the global sinks.
+                            if !app_state.clear_current_session_if(&session_id).await {
+                                return;
+                            }
+                            on_active_sessions_changed().await;
 
                             // Only detach sink if there is no active current session
                             if let Some(track) = video_track.clone() {
@@ -341,15 +360,13 @@ impl WebRTCApi {
 
                                     // Auto-unmount virtual media if last session closed and source is WebRTC
                                     if let Some(st) = storage_mod::get_virtual_media_state()
-                                        && matches!(st.source, storage_mod::VirtualMediaSource::WebRTC) {
-                                        
-                                        tokio::spawn(async move {
-                                            if let Err(e) = storage_mod::unmount_image().await {
-                                                warn!("failed to auto unmount WebRTC media: {}", e);
-                                            } else {
-                                                info!("auto unmounted WebRTC virtual media on last session close");
-                                            }
-                                        });
+                                        && matches!(st.source, storage_mod::VirtualMediaSource::WebRTC)
+                                    {
+                                        if let Err(e) = storage_mod::unmount_image().await {
+                                            warn!("failed to auto unmount WebRTC media: {}", e);
+                                        } else {
+                                            info!("auto unmounted WebRTC virtual media on disconnect");
+                                        }
                                     }
                                 }
                             }
@@ -834,8 +851,12 @@ pub async fn handle_session_takeover(
     app_state: std::sync::Arc<crate::state::AppState>,
     new_session_id: &str,
 ) {
-    let maybe_old = app_state.swap_current_session_id(new_session_id.to_string()).await;
-    on_active_sessions_changed().await;
+    let maybe_old = {
+        let _guard = MEDIA_LIFECYCLE_LOCK.lock().await;
+        let previous = app_state.swap_current_session_id(new_session_id.to_string()).await;
+        on_active_sessions_changed().await;
+        previous
+    };
 
     if let Some(ref old_id) = maybe_old
         && *old_id != new_session_id
@@ -884,6 +905,8 @@ mod tests {
     use webrtc::api::APIBuilder;
     use webrtc::peer_connection::configuration::RTCConfiguration;
     use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+    use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+    use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
     #[tokio::test]
     async fn concurrent_session_cleanup_closes_registered_peer_once() {
@@ -1048,6 +1071,8 @@ mod tests {
             .await
             .expect("replacement should remain registered");
         assert!(Arc::ptr_eq(&registered, &replacement_session));
+        assert!(!app_state.session_owns_peer("old-id", &old_peer).await);
+        assert!(app_state.session_owns_peer("old-id", &replacement_peer).await);
         assert_ne!(
             replacement_peer.connection_state(),
             RTCPeerConnectionState::Closed
@@ -1055,6 +1080,26 @@ mod tests {
 
         super::close_peer_connection(old_peer, "old-id-old-generation").await;
         super::close_peer_connection(replacement_peer, "old-id-replacement").await;
+    }
+
+    #[tokio::test]
+    async fn same_track_id_does_not_match_another_session_generation() {
+        let _guard = super::MEDIA_LIFECYCLE_LOCK.lock().await;
+        let old_track = Arc::new(TrackLocalStaticSample::new(
+            RTCRtpCodecCapability::default(),
+            "video".to_string(),
+            "arkkvm".to_string(),
+        ));
+        let replacement_track = Arc::new(TrackLocalStaticSample::new(
+            RTCRtpCodecCapability::default(),
+            "video".to_string(),
+            "arkkvm".to_string(),
+        ));
+
+        crate::video::attach_webrtc_sink(replacement_track.clone()).await;
+        assert!(!crate::video::equal_webrtc_sink(old_track).await);
+        assert!(crate::video::equal_webrtc_sink(replacement_track).await);
+        crate::video::detach_webrtc_sink().await;
     }
 
     #[tokio::test]

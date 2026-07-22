@@ -108,7 +108,7 @@ pub async fn detach_webrtc_sink() {
 
 pub async fn equal_webrtc_sink(track: Arc<TrackLocalStaticSample>) -> bool {
     if let Some(sink) = VIDEO_SINK.read().await.as_ref() {
-        sink.id() == track.id()
+        Arc::ptr_eq(sink, &track)
     }
     else {
         false

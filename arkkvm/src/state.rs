@@ -171,6 +171,19 @@ impl AppState {
         sessions.get(session_id).cloned()
     }
 
+    pub async fn session_owns_peer(
+        &self,
+        session_id: &str,
+        peer_connection: &Arc<webrtc::peer_connection::RTCPeerConnection>,
+    ) -> bool {
+        self.sessions.read().await.get(session_id).is_some_and(|session| {
+            session
+                .peer_connection
+                .as_ref()
+                .is_some_and(|registered| Arc::ptr_eq(registered, peer_connection))
+        })
+    }
+
     pub async fn update_session_rpc_channel(&self, session_id: &str, rpc_channel: Arc<RTCDataChannel>) {
         let sessions = self.sessions.read().await;
         let Some(session) = sessions.get(session_id) else {
