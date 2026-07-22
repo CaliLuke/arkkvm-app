@@ -319,10 +319,7 @@ impl CloudWebSocketClient {
 
         crate::webrtc::handle_session_takeover(app_state.clone(), &session_id).await;
 
-        // Add session to app state
         info!("Cloud WebRTC session created successfully with id: {}", &session_id);
-        // app_state.add_session(session).await;
-        app_state.set_current_session_id(Some(session_id)).await;
         Ok(())
     }
 

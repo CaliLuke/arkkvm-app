@@ -1369,9 +1369,6 @@ async fn handle_webrtc_websocket_message(
                                     )
                                     .await;
 
-                                    app_state
-                                        .set_current_session_id(Some(connection_id.to_string()))
-                                        .await;
                                 }
                                 Err(e) => {
                                     error!("Failed to exchange offer: {}", e);

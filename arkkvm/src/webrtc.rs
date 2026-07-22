@@ -78,6 +78,28 @@ async fn close_removed_session(session: Arc<Session>) {
     }
 }
 
+async fn cleanup_last_session_resources(app_state: &crate::state::AppState) {
+    if app_state.session_count().await != 0 {
+        return;
+    }
+
+    info!("Detaching video and audio sinks after last WebRTC session closed");
+    video::detach_webrtc_sink().await;
+    audio::detach_webrtc_sink().await;
+
+    if let Some(st) = storage_mod::get_virtual_media_state()
+        && matches!(st.source, storage_mod::VirtualMediaSource::WebRTC)
+    {
+        tokio::spawn(async move {
+            if let Err(e) = storage_mod::unmount_image().await {
+                warn!("failed to auto unmount WebRTC media: {}", e);
+            } else {
+                info!("auto unmounted WebRTC virtual media on last session close");
+            }
+        });
+    }
+}
+
 pub(crate) async fn remove_and_close_session(
     app_state: &crate::state::AppState,
     session_id: &str,
@@ -87,6 +109,7 @@ pub(crate) async fn remove_and_close_session(
     };
 
     close_removed_session(session).await;
+    cleanup_last_session_resources(app_state).await;
     true
 }
 
@@ -247,6 +270,7 @@ impl WebRTCApi {
 
         // Set up connection state change handler
         let session_id_clone = session.id.clone();
+        let peer_connection_for_state_callback = Arc::downgrade(&peer_connection);
         let video_track_clone = session.video_track.clone();
         let audio_track_clone = session.audio_track.clone();
 
@@ -255,6 +279,7 @@ impl WebRTCApi {
                 let session_id = session_id_clone.clone();
                 let video_track = video_track_clone.clone();
                 let audio_track = audio_track_clone.clone();
+                let peer_connection = peer_connection_for_state_callback.clone();
                 let app_state = get_global_app_state();
                 Box::pin(async move {
                     info!(
@@ -264,8 +289,12 @@ impl WebRTCApi {
 
                     match connection_state {
                         RTCIceConnectionState::Connected => {
-                            // Set as current session
-                            set_current_session(Some(session_id.clone())).await;
+                            // Signaling normally publishes the current session before ICE
+                            // connects. Only fill an empty slot so a slower old connection
+                            // cannot overwrite a newer takeover.
+                            if app_state.set_current_session_if_none(session_id.clone()).await {
+                                on_active_sessions_changed().await;
+                            }
 
                             // Bridge native video -> track (FFI ingress -> channel -> WebRTC)
                             if let Some(track) = video_track.clone() {
@@ -282,10 +311,8 @@ impl WebRTCApi {
 
                         RTCIceConnectionState::Disconnected => {
                             // Clear current session if this was the current one
-                            let mut current = get_current_session().await;
-                            if current == Some(session_id.clone()) {
-                                set_current_session(None).await;
-                                current = None;
+                            if app_state.clear_current_session_if(&session_id).await {
+                                on_active_sessions_changed().await;
                             }
 
                             // Only detach sink if there is no active current session
@@ -312,41 +339,24 @@ impl WebRTCApi {
                         }
 
                         RTCIceConnectionState::Failed | RTCIceConnectionState::Closed => {
-                            // Clear current session if this was the current one
-                            let mut current = get_current_session().await;
-                            if current == Some(session_id.clone()) {
-                                set_current_session(None).await;
-                                current = None;
-                            }
-                            let removed = app_state.remove_session(&session_id).await;
-                            info!("Removed session {} on ICE failure/close", session_id);
+                            let removed = if let Some(peer_connection) = peer_connection.upgrade() {
+                                app_state
+                                    .remove_session_for_peer(&session_id, &peer_connection)
+                                    .await
+                            } else {
+                                None
+                            };
 
                             // A failed ICE transport does not stop the peer connection's
                             // RTCP/interceptor tasks by itself. Explicitly close it after
                             // removing the session so failure callbacks cannot recurse.
                             if let Some(session) = removed {
+                                info!("Removed session {} on ICE failure/close", session_id);
                                 tokio::spawn(close_removed_session(session));
-                            }
-                            
-                            // Only detach sink if there is no active current session
-                            let count = app_state.session_count().await;
-                            if count == 0 {
-                                info!("Detaching video and audio sinks on ICE Closed");
-                                video::detach_webrtc_sink().await;
-                                audio::detach_webrtc_sink().await;
-
-                                // Auto-unmount virtual media if last session closed and source is WebRTC
-                                if let Some(st) = storage_mod::get_virtual_media_state()
-                                    && matches!(st.source, storage_mod::VirtualMediaSource::WebRTC) {
-                                    
-                                    tokio::spawn(async move {
-                                        if let Err(e) = storage_mod::unmount_image().await {
-                                            warn!("failed to auto unmount WebRTC media: {}", e);
-                                        } else {
-                                            info!("auto unmounted WebRTC virtual media on last session close");
-                                        }
-                                    });
-                                }
+                                on_active_sessions_changed().await;
+                                // Only the callback that removed the session owns teardown.
+                                // close() may emit Closed after Failed and must not repeat it.
+                                cleanup_last_session_resources(&app_state).await;
                             }
                         }
                         _ => {}
@@ -440,7 +450,10 @@ impl WebRTCApi {
         }));
 
         let session = Arc::new(session);
-        get_global_app_state().add_session(session.clone()).await;
+        if let Err(rejected_session) = get_global_app_state().add_session(session.clone()).await {
+            close_removed_session(rejected_session).await;
+            anyhow::bail!("session {} is already active", session.id);
+        }
         Ok(session)
     }
 
@@ -804,7 +817,8 @@ pub async fn handle_session_takeover(
     app_state: std::sync::Arc<crate::state::AppState>,
     new_session_id: &str,
 ) {
-    let maybe_old = app_state.get_current_session_id().await;
+    let maybe_old = app_state.swap_current_session_id(new_session_id.to_string()).await;
+    on_active_sessions_changed().await;
 
     if let Some(ref old_id) = maybe_old
         && *old_id != new_session_id
@@ -869,6 +883,88 @@ mod tests {
             peer_connection.connection_state(),
             RTCPeerConnectionState::Closed
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_session_id_cannot_replace_or_remove_active_peer() {
+        let api = APIBuilder::new().build();
+        let active_peer = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .expect("active peer connection should be created"),
+        );
+        let duplicate_peer = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .expect("duplicate peer connection should be created"),
+        );
+        let app_state = crate::state::AppState::new();
+
+        let mut active_session = crate::session::Session::new("reused-id".to_string());
+        active_session.peer_connection = Some(active_peer.clone());
+        let active_session = Arc::new(active_session);
+        {
+            let mut sessions = app_state.sessions.write().await;
+            sessions.insert(active_session.id.clone(), active_session.clone());
+            sessions.insert(
+                "sentinel-session".to_string(),
+                Arc::new(crate::session::Session::new("sentinel-session".to_string())),
+            );
+        }
+
+        let mut duplicate_session = crate::session::Session::new("reused-id".to_string());
+        duplicate_session.peer_connection = Some(duplicate_peer.clone());
+        assert!(app_state.add_session(Arc::new(duplicate_session)).await.is_err());
+        assert!(
+            app_state
+                .remove_session_for_peer("reused-id", &duplicate_peer)
+                .await
+                .is_none()
+        );
+
+        let registered = app_state
+            .get_session_by_id("reused-id")
+            .await
+            .expect("active session should remain registered");
+        assert!(Arc::ptr_eq(&registered, &active_session));
+        assert!(
+            app_state
+                .remove_session_for_peer("reused-id", &active_peer)
+                .await
+                .is_some()
+        );
+        assert!(
+            app_state
+                .remove_session_for_peer("reused-id", &active_peer)
+                .await
+                .is_none(),
+            "a Failed callback followed by Closed must have only one cleanup owner"
+        );
+
+        super::close_peer_connection(active_peer, "reused-id").await;
+        super::close_peer_connection(duplicate_peer, "reused-id-duplicate").await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_current_session_swaps_preserve_every_predecessor() {
+        let app_state = crate::state::AppState::new();
+        app_state.set_current_session_id(Some("original".to_string())).await;
+
+        let (first_previous, second_previous) = tokio::join!(
+            app_state.swap_current_session_id("first".to_string()),
+            app_state.swap_current_session_id("second".to_string()),
+        );
+
+        let mut observed = vec![
+            first_previous.expect("first swap should return a predecessor"),
+            second_previous.expect("second swap should return a predecessor"),
+            app_state
+                .get_current_session_id()
+                .await
+                .expect("one replacement should remain current"),
+        ];
+        observed.sort();
+        assert_eq!(observed, vec!["first", "original", "second"]);
     }
 
     #[tokio::test]
