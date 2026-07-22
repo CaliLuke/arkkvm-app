@@ -250,9 +250,16 @@ impl WebRTCApi {
         info!("Created video track: kind={}", video_track.kind());
 
         // Add video track to peer connection
-        let _video_rtp_sender = peer_connection
+        let _video_rtp_sender = match peer_connection
             .add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal + Send + Sync>)
-            .await?;
+            .await
+        {
+            Ok(sender) => sender,
+            Err(e) => {
+                close_peer_connection(peer_connection.clone(), &session_id).await;
+                return Err(e.into());
+            }
+        };
 
         info!("Added video track to peer connection");
 
@@ -269,9 +276,16 @@ impl WebRTCApi {
 
         info!("Created audio track: kind={}", audio_track.kind());
 
-        let _audio_rtp_sender = peer_connection
+        let _audio_rtp_sender = match peer_connection
             .add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal + Send + Sync>)
-            .await?;
+            .await
+        {
+            Ok(sender) => sender,
+            Err(e) => {
+                close_peer_connection(peer_connection.clone(), &session_id).await;
+                return Err(e.into());
+            }
+        };
 
         info!("Added audio track to peer connection");
 
