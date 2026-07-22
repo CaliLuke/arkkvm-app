@@ -202,7 +202,6 @@ dependencies = [
  "prost",
  "prost-build",
  "protoc-bin-vendored",
- "rockchip_mpi_sys",
  "rustix",
  "serde",
  "serde_json",

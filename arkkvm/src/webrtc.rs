@@ -32,6 +32,21 @@ use crate::web::get_global_app_state;
 use crate::{audio, video, zenoh_bus};
 
 static MEDIA_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+const PEER_CONNECTION_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+pub(crate) async fn close_peer_connection(
+    peer_connection: Arc<webrtc::peer_connection::RTCPeerConnection>,
+    session_id: &str,
+) {
+    match tokio::time::timeout(PEER_CONNECTION_CLOSE_TIMEOUT, peer_connection.close()).await {
+        Ok(Ok(())) => info!("Closed peer connection for session {}", session_id),
+        Ok(Err(e)) => warn!("Failed to close peer connection for session {}: {}", session_id, e),
+        Err(_) => warn!(
+            "Timed out closing peer connection for session {} after {:?}",
+            session_id, PEER_CONNECTION_CLOSE_TIMEOUT
+        ),
+    }
+}
 
 /// Session configuration for WebRTC connections
 #[derive(Debug, Clone)]
@@ -230,7 +245,7 @@ impl WebRTCApi {
                                 set_current_session(None).await;
                                 current = None;
                             }
-                            
+
                             // Only detach sink if there is no active current session
                             if let Some(track) = video_track.clone() {
                                 if video::equal_webrtc_sink(track).await {
@@ -261,8 +276,20 @@ impl WebRTCApi {
                                 set_current_session(None).await;
                                 current = None;
                             }
-                            app_state.remove_session(&session_id).await;
-                            info!("Removed session {} on ICE Closed", session_id);
+                            let removed = app_state.remove_session(&session_id).await;
+                            info!("Removed session {} on ICE failure/close", session_id);
+
+                            // A failed ICE transport does not stop the peer connection's
+                            // RTCP/interceptor tasks by itself. Explicitly close it after
+                            // removing the session so failure callbacks cannot recurse.
+                            if let Some(peer_connection) = removed
+                                .and_then(|session| session.peer_connection.clone())
+                            {
+                                let failed_session_id = session_id.clone();
+                                tokio::spawn(async move {
+                                    close_peer_connection(peer_connection, &failed_session_id).await;
+                                });
+                            }
                             
                             // Only detach sink if there is no active current session
                             let count = app_state.session_count().await;
@@ -761,11 +788,37 @@ pub async fn handle_session_takeover(
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             if let Some(old_sess) = app_state_cl.get_session_by_id(&old_id_cl).await {
                 if let Some(pc) = old_sess.peer_connection.as_ref() {
-                    let _ = pc.close().await;
+                    close_peer_connection(pc.clone(), &old_id_cl).await;
                 }
                 app_state_cl.remove_session(&old_id_cl).await;
                 tracing::info!("Closed previous session {}", old_id_cl);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use webrtc::api::APIBuilder;
+    use webrtc::peer_connection::configuration::RTCConfiguration;
+    use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+
+    #[tokio::test]
+    async fn close_peer_connection_stops_failed_session_tasks() {
+        let api = APIBuilder::new().build();
+        let peer_connection = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .expect("peer connection should be created"),
+        );
+
+        super::close_peer_connection(peer_connection.clone(), "test-session").await;
+
+        assert_eq!(
+            peer_connection.connection_state(),
+            RTCPeerConnectionState::Closed
+        );
     }
 }

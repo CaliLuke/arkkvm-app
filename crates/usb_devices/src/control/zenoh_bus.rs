@@ -6,10 +6,17 @@ use zenoh::config::ZenohId;
 static ZENOH_SESSION: once_cell::sync::OnceCell<zenoh::Session> = once_cell::sync::OnceCell::new();
 
 pub fn get_session() -> zenoh::Session {
-    ZENOH_SESSION
-        .get()
-        .expect("Zenoh session not initialized")
-        .clone()
+    session_from(&ZENOH_SESSION).expect("Zenoh session not initialized")
+}
+
+pub fn try_get_session() -> Result<zenoh::Session> {
+    session_from(&ZENOH_SESSION)
+}
+
+fn session_from(cell: &once_cell::sync::OnceCell<zenoh::Session>) -> Result<zenoh::Session> {
+    cell.get()
+        .cloned()
+        .ok_or_else(|| anyhow!("Zenoh session not initialized"))
 }
 
 pub async fn init() -> Result<()> {
@@ -57,4 +64,18 @@ pub async fn init() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use once_cell::sync::OnceCell;
+
+    #[test]
+    fn session_lookup_before_initialization_returns_error() {
+        let cell = OnceCell::new();
+
+        let result = super::session_from(&cell);
+
+        assert!(result.is_err());
+    }
 }

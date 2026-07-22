@@ -4,7 +4,9 @@ use std::process::Command;
 
 fn main() {
     compile_protos();
-    cross_compile::build_c_shims();
+    if env::var("TARGET").is_ok_and(|target| target.starts_with("armv7-")) {
+        cross_compile::build_c_shims();
+    }
 }
 
 fn compile_protos() {

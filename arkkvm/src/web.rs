@@ -1282,7 +1282,7 @@ async fn handle_webrtc_websocket(
 
     if let Some(sess) = app_state.get_session_by_id(&connection_id).await {
         if let Some(pc) = sess.peer_connection.as_ref() {
-            let _ = pc.close().await;
+            crate::webrtc::close_peer_connection(pc.clone(), &connection_id).await;
         }
         app_state.remove_session(&connection_id).await;
         info!("Removed session {} on websocket close", connection_id);
