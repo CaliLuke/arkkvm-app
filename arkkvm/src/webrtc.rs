@@ -99,6 +99,34 @@ async fn cleanup_last_session_resources(app_state: &crate::state::AppState) {
     }
 }
 
+async fn attach_current_session_sinks_if_connected(
+    app_state: &crate::state::AppState,
+    session_id: &str,
+    connection_state: RTCIceConnectionState,
+) {
+    if app_state.get_current_session_id().await.as_deref() != Some(session_id) {
+        return;
+    }
+    let Some(session) = app_state.get_session_by_id(session_id).await else {
+        return;
+    };
+    if !matches!(
+        connection_state,
+        RTCIceConnectionState::Connected | RTCIceConnectionState::Completed
+    ) {
+        return;
+    }
+
+    if let Some(track) = session.video_track.clone() {
+        video::attach_webrtc_sink(track).await;
+        info!("Video track attached to WebRTC session {}", session_id);
+    }
+    if let Some(track) = session.audio_track.clone() {
+        audio::attach_webrtc_sink(track).await;
+        info!("Audio track attached to WebRTC session {}", session_id);
+    }
+}
+
 pub(crate) async fn remove_and_close_session(
     app_state: &crate::state::AppState,
     session_id: &str,
@@ -285,13 +313,11 @@ impl WebRTCApi {
         let session_id_clone = session.id.clone();
         let peer_connection_for_state_callback = Arc::downgrade(&peer_connection);
         let video_track_clone = session.video_track.clone();
-        let audio_track_clone = session.audio_track.clone();
 
         peer_connection.on_ice_connection_state_change(Box::new(
             move |connection_state: RTCIceConnectionState| {
                 let session_id = session_id_clone.clone();
                 let video_track = video_track_clone.clone();
-                let audio_track = audio_track_clone.clone();
                 let peer_connection = peer_connection_for_state_callback.clone();
                 let app_state = get_global_app_state();
                 Box::pin(async move {
@@ -323,17 +349,12 @@ impl WebRTCApi {
                                 return;
                             }
 
-                            // Bridge native video -> track (FFI ingress -> channel -> WebRTC)
-                            if let Some(track) = video_track.clone() {
-                                video::attach_webrtc_sink(track).await;
-                                info!("Video track attached to WebRTC session {}", &session_id);
-                            }
-
-                            // Bridge native audio -> track (FFI ingress -> channel -> WebRTC)
-                            if let Some(track) = audio_track.clone() {
-                                audio::attach_webrtc_sink(track).await;
-                                info!("Audio track attached to WebRTC session {}", &session_id);
-                            }
+                            attach_current_session_sinks_if_connected(
+                                &app_state,
+                                &session_id,
+                                connection_state,
+                            )
+                            .await;
                         }
 
                         RTCIceConnectionState::Disconnected => {
@@ -855,6 +876,18 @@ pub async fn handle_session_takeover(
         let _guard = MEDIA_LIFECYCLE_LOCK.lock().await;
         let previous = app_state.swap_current_session_id(new_session_id.to_string()).await;
         on_active_sessions_changed().await;
+        let connection_state = app_state
+            .get_session_by_id(new_session_id)
+            .await
+            .and_then(|session| session.peer_connection.clone())
+            .map(|peer| peer.ice_connection_state())
+            .unwrap_or(RTCIceConnectionState::Unspecified);
+        attach_current_session_sinks_if_connected(
+            &app_state,
+            new_session_id,
+            connection_state,
+        )
+        .await;
         previous
     };
 
@@ -903,6 +936,7 @@ mod tests {
 
     use tokio::sync::{Barrier, Notify, oneshot};
     use webrtc::api::APIBuilder;
+    use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
     use webrtc::peer_connection::configuration::RTCConfiguration;
     use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
     use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
@@ -1100,6 +1134,44 @@ mod tests {
         assert!(!crate::video::equal_webrtc_sink(old_track).await);
         assert!(crate::video::equal_webrtc_sink(replacement_track).await);
         crate::video::detach_webrtc_sink().await;
+    }
+
+    #[tokio::test]
+    async fn takeover_attaches_session_that_connected_before_publication() {
+        let _guard = super::MEDIA_LIFECYCLE_LOCK.lock().await;
+        let app_state = crate::state::AppState::new();
+        let video_track = Arc::new(TrackLocalStaticSample::new(
+            RTCRtpCodecCapability::default(),
+            "video".to_string(),
+            "arkkvm".to_string(),
+        ));
+        let audio_track = Arc::new(TrackLocalStaticSample::new(
+            RTCRtpCodecCapability::default(),
+            "audio".to_string(),
+            "arkkvm".to_string(),
+        ));
+        let mut session = crate::session::Session::new("already-connected".to_string());
+        session.video_track = Some(video_track.clone());
+        session.audio_track = Some(audio_track);
+        app_state
+            .sessions
+            .write()
+            .await
+            .insert(session.id.clone(), Arc::new(session));
+        app_state
+            .set_current_session_id(Some("already-connected".to_string()))
+            .await;
+
+        super::attach_current_session_sinks_if_connected(
+            &app_state,
+            "already-connected",
+            RTCIceConnectionState::Connected,
+        )
+        .await;
+
+        assert!(crate::video::equal_webrtc_sink(video_track).await);
+        crate::video::detach_webrtc_sink().await;
+        crate::audio::detach_webrtc_sink().await;
     }
 
     #[tokio::test]
