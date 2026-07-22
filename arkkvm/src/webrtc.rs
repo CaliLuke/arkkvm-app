@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -34,18 +35,59 @@ use crate::{audio, video, zenoh_bus};
 static MEDIA_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 const PEER_CONNECTION_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+async fn wait_for_background_cleanup<F, T>(
+    cleanup: F,
+    wait_timeout: std::time::Duration,
+) -> Option<Result<T, tokio::task::JoinError>>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut task = tokio::spawn(cleanup);
+    tokio::time::timeout(wait_timeout, &mut task).await.ok()
+}
+
 pub(crate) async fn close_peer_connection(
     peer_connection: Arc<webrtc::peer_connection::RTCPeerConnection>,
     session_id: &str,
 ) {
-    match tokio::time::timeout(PEER_CONNECTION_CLOSE_TIMEOUT, peer_connection.close()).await {
-        Ok(Ok(())) => info!("Closed peer connection for session {}", session_id),
-        Ok(Err(e)) => warn!("Failed to close peer connection for session {}: {}", session_id, e),
-        Err(_) => warn!(
-            "Timed out closing peer connection for session {} after {:?}",
+    match wait_for_background_cleanup(
+        async move { peer_connection.close().await },
+        PEER_CONNECTION_CLOSE_TIMEOUT,
+    )
+    .await
+    {
+        Some(Ok(Ok(()))) => info!("Closed peer connection for session {}", session_id),
+        Some(Ok(Err(e))) => {
+            warn!("Failed to close peer connection for session {}: {}", session_id, e)
+        }
+        Some(Err(e)) => warn!(
+            "Peer connection cleanup task failed for session {}: {}",
+            session_id, e
+        ),
+        None => warn!(
+            "Peer connection cleanup for session {} is still running after {:?}",
             session_id, PEER_CONNECTION_CLOSE_TIMEOUT
         ),
     }
+}
+
+async fn close_removed_session(session: Arc<Session>) {
+    if let Some(peer_connection) = session.peer_connection.clone() {
+        close_peer_connection(peer_connection, &session.id).await;
+    }
+}
+
+pub(crate) async fn remove_and_close_session(
+    app_state: &crate::state::AppState,
+    session_id: &str,
+) -> bool {
+    let Some(session) = app_state.remove_session(session_id).await else {
+        return false;
+    };
+
+    close_removed_session(session).await;
+    true
 }
 
 /// Session configuration for WebRTC connections
@@ -282,13 +324,8 @@ impl WebRTCApi {
                             // A failed ICE transport does not stop the peer connection's
                             // RTCP/interceptor tasks by itself. Explicitly close it after
                             // removing the session so failure callbacks cannot recurse.
-                            if let Some(peer_connection) = removed
-                                .and_then(|session| session.peer_connection.clone())
-                            {
-                                let failed_session_id = session_id.clone();
-                                tokio::spawn(async move {
-                                    close_peer_connection(peer_connection, &failed_session_id).await;
-                                });
+                            if let Some(session) = removed {
+                                tokio::spawn(close_removed_session(session));
                             }
                             
                             // Only detach sink if there is no active current session
@@ -786,11 +823,7 @@ pub async fn handle_session_takeover(
         let old_id_cl = old_id.clone();
         tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            if let Some(old_sess) = app_state_cl.get_session_by_id(&old_id_cl).await {
-                if let Some(pc) = old_sess.peer_connection.as_ref() {
-                    close_peer_connection(pc.clone(), &old_id_cl).await;
-                }
-                app_state_cl.remove_session(&old_id_cl).await;
+            if remove_and_close_session(&app_state_cl, &old_id_cl).await {
                 tracing::info!("Closed previous session {}", old_id_cl);
             }
         });
@@ -801,24 +834,65 @@ pub async fn handle_session_takeover(
 mod tests {
     use std::sync::Arc;
 
+    use tokio::sync::{Notify, oneshot};
     use webrtc::api::APIBuilder;
     use webrtc::peer_connection::configuration::RTCConfiguration;
     use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 
     #[tokio::test]
-    async fn close_peer_connection_stops_failed_session_tasks() {
+    async fn concurrent_session_cleanup_closes_registered_peer_once() {
         let api = APIBuilder::new().build();
         let peer_connection = Arc::new(
             api.new_peer_connection(RTCConfiguration::default())
                 .await
                 .expect("peer connection should be created"),
         );
+        let app_state = crate::state::AppState::new();
+        let mut session = crate::session::Session::new("test-session".to_string());
+        session.peer_connection = Some(peer_connection.clone());
+        {
+            let mut sessions = app_state.sessions.write().await;
+            sessions.insert(session.id.clone(), Arc::new(session));
+            sessions.insert(
+                "sentinel-session".to_string(),
+                Arc::new(crate::session::Session::new("sentinel-session".to_string())),
+            );
+        }
 
-        super::close_peer_connection(peer_connection.clone(), "test-session").await;
+        let (first_removal, second_removal) = tokio::join!(
+            super::remove_and_close_session(&app_state, "test-session"),
+            super::remove_and_close_session(&app_state, "test-session"),
+        );
 
+        assert_ne!(first_removal, second_removal);
         assert_eq!(
             peer_connection.connection_state(),
             RTCPeerConnectionState::Closed
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_continues_after_wait_timeout() {
+        let (release_cleanup, wait_for_release) = oneshot::channel();
+        let cleanup_finished = Arc::new(Notify::new());
+        let cleanup_finished_in_task = cleanup_finished.clone();
+
+        let wait_result = super::wait_for_background_cleanup(
+            async move {
+                let _ = wait_for_release.await;
+                cleanup_finished_in_task.notify_one();
+            },
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+
+        assert!(wait_result.is_none());
+        release_cleanup.send(()).expect("cleanup task should still be running");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cleanup_finished.notified(),
+        )
+        .await
+        .expect("detached cleanup should finish after the caller stops waiting");
     }
 }

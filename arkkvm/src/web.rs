@@ -935,10 +935,16 @@ async fn handle_webrtc_session(
             StatusError::internal_server_error().brief(format!("Failed to create session: {e}"))
         })?;
 
-    let answer = session.exchange_offer(&request.sd).await.map_err(|e| {
-        warn!("Failed to exchange offer: {}", e);
-        StatusError::internal_server_error().brief(format!("Failed to exchange offer: {e}"))
-    })?;
+    let answer = match session.exchange_offer(&request.sd).await {
+        Ok(answer) => answer,
+        Err(e) => {
+            warn!("Failed to exchange offer: {}", e);
+            crate::webrtc::remove_and_close_session(&app_state, &session.id).await;
+            return Err(
+                StatusError::internal_server_error().brief(format!("Failed to exchange offer: {e}"))
+            );
+        }
+    };
 
     let session_id = session.id.clone();
     info!("WebRTC session created successfully with id: {}", &session_id);
@@ -1280,11 +1286,7 @@ async fn handle_webrtc_websocket(
         }
     }
 
-    if let Some(sess) = app_state.get_session_by_id(&connection_id).await {
-        if let Some(pc) = sess.peer_connection.as_ref() {
-            crate::webrtc::close_peer_connection(pc.clone(), &connection_id).await;
-        }
-        app_state.remove_session(&connection_id).await;
+    if crate::webrtc::remove_and_close_session(&app_state, &connection_id).await {
         info!("Removed session {} on websocket close", connection_id);
     }
 
@@ -1352,6 +1354,11 @@ async fn handle_webrtc_websocket_message(
                                     let response_str = response.to_string();
                                     
                                     if ws.send(Message::text(response_str)).await.is_err() {
+                                        crate::webrtc::remove_and_close_session(
+                                            app_state,
+                                            connection_id,
+                                        )
+                                        .await;
                                         return Err(anyhow::anyhow!("Failed to send answer"));
                                     }
 
@@ -1368,6 +1375,11 @@ async fn handle_webrtc_websocket_message(
                                 }
                                 Err(e) => {
                                     error!("Failed to exchange offer: {}", e);
+                                    crate::webrtc::remove_and_close_session(
+                                        app_state,
+                                        connection_id,
+                                    )
+                                    .await;
                                 }
                             }
                         }
